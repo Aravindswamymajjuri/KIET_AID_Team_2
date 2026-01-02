@@ -379,5 +379,51 @@
     "metadata": {
       "audio_file": "voice_input.webm"
     }
+  },
+  {
+    "timestamp": "2026-01-02T15:25:00.581792",
+    "user_input": "how to treat fever",
+    "bot_response": "if you have a fever, take ibuprofen.",
+    "input_type": "voice",
+    "metadata": {
+      "audio_file": "voice_input.webm"
+    }
+  },
+  {
+    "timestamp": "2026-01-02T15:25:19.205652",
+    "user_input": "is Ibuprofen better or Paracetamol better to drink",
+    "bot_response": "Ibuprofen",
+    "input_type": "voice",
+    "metadata": {
+      "audio_file": "voice_input.webm"
+    }
+  },
+  {
+    "timestamp": "2026-01-02T15:25:40.725871",
+    "user_input": "but in medical stores it's not available can I use Paracetamol",
+    "bot_response": "but in medical stores it's not available can I use Paracetamol",
+    "input_type": "voice",
+    "metadata": {
+      "audio_file": "voice_input.webm"
+    }
+  },
+  {
+    "timestamp": "2026-01-02T15:26:08.519199",
+    "user_input": "which medicine used to treat fever",
+    "bot_response": "ibuprofen",
+    "input_type": "voice",
+    "metadata": {
+      "audio_file": "voice_input.webm"
+    }
+  },
+  {
+    "timestamp": "2026-01-02T16:06:32.112287",
+    "user_input": "hello how to treat fever at home",
+    "bot_response": "if you have a fever, you can take ibuprofen or acetaminophen to treat it at home.",
+    "input_type": "voice",
+    "metadata": {
+      "audio_file": "voice_input.webm",
+      "user_id": "e47a479d-3ed7-47f3-9d8b-5882f5e971d2"
+    }
   }
 ]

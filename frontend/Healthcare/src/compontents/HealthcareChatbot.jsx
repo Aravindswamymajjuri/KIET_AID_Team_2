@@ -8,18 +8,18 @@
 // ===================== 2. HEALTHCARECHATBOT.JSX (COMPLETE WORKING VERSION) =====================
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { FiMic, FiSend, FiRefreshCw, FiTrash2, FiVolume2, FiStopCircle } from 'react-icons/fi';
+import { FiMic, FiSend, FiRefreshCw, FiTrash2, FiVolume2, FiStopCircle, FiLogOut, FiUser } from 'react-icons/fi';
 import './HealthcareChatbot.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-const HealthcareChatbot = () => {
+const HealthcareChatbot = ({ currentUser, onLogout }) => {
   // ========== STATE MANAGEMENT ==========
   const [messages, setMessages] = useState([
     {
       id: 1,
       type: 'bot',
-      text: 'Hello! I\'m your healthcare assistant. How can I help you today? You can type or use voice input.',
+      text: `Hello${currentUser?.username ? ' ' + currentUser.username : ''}! I'm your healthcare assistant. How can I help you today? You can type or use voice input.`,
       timestamp: new Date(),
     },
   ]);
@@ -31,22 +31,7 @@ const HealthcareChatbot = () => {
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
 
-  // ====== AUTH ======
-  const [token, setToken] = useState(localStorage.getItem('token') || null);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('token'));
 
-  // Apply token to axios default headers
-  useEffect(() => {
-    if (token) {
-      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      localStorage.setItem('token', token);
-    } else {
-      delete axios.defaults.headers.common['Authorization'];
-      localStorage.removeItem('token');
-    }
-  }, [token]);
 
   // ========== REFS ==========
   const messagesEndRef = useRef(null);
@@ -69,11 +54,11 @@ const HealthcareChatbot = () => {
 
     checkMicrophoneSupport();
 
-    // If token exists on mount, fetch history
-    if (isAuthenticated) {
+    // Fetch history on mount if user is authenticated
+    if (currentUser) {
       fetchHistory();
     }
-  }, [isAuthenticated]);
+  }, [currentUser]);
 
   // ========== AUTO SCROLL TO LATEST MESSAGE ==========
   useEffect(() => {
@@ -349,57 +334,7 @@ const HealthcareChatbot = () => {
     setInputText('');
   };
 
-  // ====== AUTH HELPERS ======
-  const signup = async (e) => {
-    e.preventDefault();
-    setError('');
-    try {
-      const resp = await axios.post(`${API_BASE_URL}/api/auth/signup`, { username, password });
-      if (resp.data.status === 'success') {
-        setSuccessMessage('Signup successful — you can login now');
-      }
-    } catch (err) {
-      setError(err.response?.data?.detail || err.message);
-    }
-  };
-
-  const login = async (e) => {
-    e.preventDefault();
-    setError('');
-    try {
-      const resp = await axios.post(`${API_BASE_URL}/api/auth/login`, { username, password });
-      if (resp.data.status === 'success') {
-        setToken(resp.data.token);
-        setIsAuthenticated(true);
-        setSuccessMessage('Logged in');
-        // fetch user chat history
-        await fetchHistory();
-      }
-    } catch (err) {
-      setError(err.response?.data?.detail || err.message);
-    }
-  };
-
-  const logout = async () => {
-    try {
-      await axios.post(`${API_BASE_URL}/api/auth/logout`);
-    } catch (err) {
-      // ignore
-    }
-    setToken(null);
-    setIsAuthenticated(false);
-    setSuccessMessage('Logged out');
-    // clear to initial message
-    setMessages([
-      {
-        id: generateId(),
-        type: 'bot',
-        text: 'Hello! I\'m your healthcare assistant. How can I help you today? You can type or use voice input.',
-        timestamp: new Date(),
-      },
-    ]);
-  };
-
+  // ====== FETCH CHAT HISTORY ======
   const fetchHistory = async () => {
     setIsLoading(true);
     setError('');
@@ -427,24 +362,21 @@ const HealthcareChatbot = () => {
   return (
     <div className="chatbot-container">
       <div className="chatbot-header">
-        <h1>🏥 Healthcare Chatbot</h1>
-        <p className="subtitle">Voice & Text Support with AI Model</p>
-
-        {/* Simple Auth UI */}
-        <div style={{ marginTop: '10px' }}>
-          {!isAuthenticated ? (
-            <form style={{ display: 'flex', gap: '8px', alignItems: 'center' }} onSubmit={(e) => login(e)}>
-              <input placeholder="username" value={username} onChange={(e) => setUsername(e.target.value)} />
-              <input placeholder="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-              <button type="submit" className="btn">Login</button>
-              <button type="button" onClick={(e) => signup(e)} className="btn">Signup</button>
-            </form>
-          ) : (
-            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-              <strong>Signed in</strong>
-              <button className="btn" onClick={logout}>Logout</button>
+        <div className="header-content">
+          <div>
+            <h1>🏥 Healthcare Chatbot</h1>
+            <p className="subtitle">Voice & Text Support with AI Model</p>
+          </div>
+          <div className="user-info">
+            <div className="user-details">
+              <FiUser className="user-icon" />
+              <span className="username">{currentUser?.username || 'User'}</span>
             </div>
-          )}
+            <button className="logout-btn" onClick={onLogout} title="Logout">
+              <FiLogOut />
+              <span>Logout</span>
+            </button>
+          </div>
         </div>
       </div>
 

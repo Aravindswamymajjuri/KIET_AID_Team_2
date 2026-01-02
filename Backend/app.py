@@ -33,6 +33,9 @@ import time
 from functools import wraps
 import numpy as np
 
+# Import authentication module
+from auth import auth_manager, UserCreate, UserLogin, AuthResponse, UserResponse
+
 # ===================== 3. LOGGING SETUP =====================
 logging.basicConfig(
     level=logging.INFO,
@@ -422,10 +425,15 @@ class LoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
 
+class UserInfo(BaseModel):
+    id: str
+    username: str
+
 class AuthResponse(BaseModel):
     status: str
     token: Optional[str] = None
-    user_id: Optional[str] = None
+    user: Optional[UserInfo] = None
+    message: Optional[str] = None
 
 class UsersManager:
     """Simple file-backed user manager with token sessions"""
@@ -579,7 +587,13 @@ async def signup(payload: SignupRequest):
     """Create a new user account"""
     try:
         user = users_manager.create_user(payload.username, payload.password)
-        return AuthResponse(status='success', user_id=user['id'])
+        token = users_manager.create_token(user['id'])
+        return AuthResponse(
+            status='success', 
+            token=token,
+            user=UserInfo(id=user['id'], username=user['username']),
+            message='Account created successfully'
+        )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -594,7 +608,12 @@ async def login(payload: LoginRequest):
         if not user:
             raise HTTPException(status_code=401, detail='Invalid username or password')
         token = users_manager.create_token(user['id'])
-        return AuthResponse(status='success', token=token, user_id=user['id'])
+        return AuthResponse(
+            status='success', 
+            token=token,
+            user=UserInfo(id=user['id'], username=user['username']),
+            message='Login successful'
+        )
     except HTTPException:
         raise
     except Exception as e:

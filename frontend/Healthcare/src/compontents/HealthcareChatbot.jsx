@@ -23,6 +23,10 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
       timestamp: new Date(),
     },
   ]);
+  const [activeConversationId, setActiveConversationId] = useState(null);
+  const [conversations, setConversations] = useState([]);
+  const [conversationsLoading, setConversationsLoading] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -54,9 +58,33 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
 
     checkMicrophoneSupport();
 
-    // Fetch history on mount if user is authenticated
+      // Fetch conversation list on mount if user is authenticated
     if (currentUser) {
-      fetchHistory();
+      fetchConversations().then(async () => {
+        // If user had an active conversation stored in localStorage, load it
+        const saved = localStorage.getItem('activeConversationId');
+        if (saved) {
+          try {
+            await loadConversation(saved);
+            setActiveConversationId(saved);
+            return;
+          } catch (e) {
+            // ignore and fallback to loading latest
+            console.warn('Failed to load saved conversation:', e);
+          }
+        }
+
+        // else auto-open the most recent conversation if any
+        try {
+          const resp = await axios.get(`${API_BASE_URL}/api/chat/conversations`);
+          if (resp.data?.status === 'success' && resp.data.data && resp.data.data.length) {
+            const latest = resp.data.data[0];
+            loadConversation(latest.conversation_id);
+          } else {
+            // no existing conversations, keep default greeting
+          }
+        } catch (_) {}
+      });
     }
   }, [currentUser]);
 
@@ -78,6 +106,15 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
       return () => clearTimeout(timer);
     }
   }, [error, successMessage]);
+
+  // Persist active conversation id in localStorage whenever it changes
+  useEffect(() => {
+    if (activeConversationId) {
+      localStorage.setItem('activeConversationId', activeConversationId);
+    } else {
+      localStorage.removeItem('activeConversationId');
+    }
+  }, [activeConversationId]);
 
   // ========== SPEECH SYNTHESIS (Text-to-Speech) ==========
   const speakResponse = (text) => {
@@ -105,6 +142,78 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
 
   // ========== API CALLS ==========
 
+  // Fetch user's conversation list
+  const fetchConversations = async () => {
+    setConversationsLoading(true);
+    try {
+      const resp = await axios.get(`${API_BASE_URL}/api/chat/conversations`);
+      if (resp.data?.status === 'success') {
+        setConversations(resp.data.data || []);
+      }
+    } catch (e) {
+      console.warn('Failed to load conversations:', e);
+    } finally {
+      setConversationsLoading(false);
+    }
+  };
+
+  // Load a conversation's messages
+  const loadConversation = async (conversationId) => {
+    setIsLoading(true);
+    setError('');
+    try {
+      const resp = await axios.get(`${API_BASE_URL}/api/chat/conversations/${conversationId}`);
+      if (resp.data?.status === 'success') {
+        const msgs = [];
+        resp.data.data.forEach((m) => {
+          if (m.user_input) msgs.push({ id: generateId(), type: 'user', text: m.user_input, timestamp: new Date(m.timestamp) });
+          if (m.bot_response) msgs.push({ id: generateId(), type: 'bot', text: m.bot_response, timestamp: new Date(m.timestamp) });
+        });
+        setMessages(msgs.length ? msgs : [
+          { id: generateId(), type: 'bot', text: 'Conversation started.', timestamp: new Date() }
+        ]);
+        setActiveConversationId(conversationId);
+        localStorage.setItem('activeConversationId', conversationId);
+        setSuccessMessage('Conversation loaded');
+      }
+    } catch (err) {
+      console.error('❌ Error loading conversation:', err);
+      setError('Failed to load conversation');
+      // If load failed (e.g., conversation deleted or unauthorized), clear saved id
+      localStorage.removeItem('activeConversationId');
+      setActiveConversationId(null);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Create a new conversation on the server and load it
+  const startNewConversation = async (initialMessage = null) => {
+    setIsLoading(true);
+    setError('');
+    try {
+      const resp = await axios.post(`${API_BASE_URL}/api/chat/conversations`, initialMessage ? { initial_message: initialMessage } : {});
+      if (resp.data?.status === 'success' && resp.data.conversation_id) {
+        const convId = resp.data.conversation_id;
+        setActiveConversationId(convId);
+        // persist
+        localStorage.setItem('activeConversationId', convId);
+        // load conversation messages (should include initial message)
+        await loadConversation(convId);
+        // refresh list
+        fetchConversations();
+        setSuccessMessage('New chat started');
+      } else {
+        setError('Failed to create new conversation');
+      }
+    } catch (err) {
+      console.error('❌ Error creating conversation:', err);
+      setError(err.response?.data?.detail || 'Failed to create conversation');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   // Send text message to backend
   const sendTextMessage = async (text) => {
     if (!text.trim()) return;
@@ -124,12 +233,24 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
       setMessages((prev) => [...prev, userMessage]);
       setInputText('');
 
-      console.log('📤 Sending text to backend:', text);
+      console.log('📤 Sending text to backend:', text, 'conv=', activeConversationId);
 
-      // Send to API
+      // If no active conversation, create one first
+      let convId = activeConversationId;
+      if (!convId) {
+        const createResp = await axios.post(`${API_BASE_URL}/api/chat/conversations`, {});
+        if (createResp.data?.status === 'success' && createResp.data.conversation_id) {
+          convId = createResp.data.conversation_id;
+          setActiveConversationId(convId);
+          localStorage.setItem('activeConversationId', convId);
+          fetchConversations();
+        }
+      }
+
+      // Send to API (include conversation_id)
       const response = await axios.post(
         `${API_BASE_URL}/api/chat/text`,
-        { text: text.trim() },
+        { text: text.trim(), conversation_id: convId },
         { timeout: 30000 }
       );
 
@@ -147,6 +268,14 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
 
         setMessages((prev) => [...prev, botMessage]);
         setSuccessMessage('✅ Response received!');
+
+        // Save conversation id returned by backend for subsequent messages
+        if (response.data.conversation_id) {
+          setActiveConversationId(response.data.conversation_id);
+          localStorage.setItem('activeConversationId', response.data.conversation_id);
+          // Refresh conversation list
+          fetchConversations();
+        }
       } else {
         setError('❌ Failed to get response from server');
       }
@@ -240,6 +369,24 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
       const formData = new FormData();
       formData.append('file', audioBlob, `voice_input.${extension}`);
 
+      // If no active conversation, create one on the server and attach it
+      let convId = activeConversationId;
+      if (!convId) {
+        try {
+          const createResp = await axios.post(`${API_BASE_URL}/api/chat/conversations`, {});
+          if (createResp.data?.status === 'success' && createResp.data.conversation_id) {
+            convId = createResp.data.conversation_id;
+            setActiveConversationId(convId);
+            localStorage.setItem('activeConversationId', convId);
+            fetchConversations();
+          }
+        } catch (e) {
+          console.warn('Failed to create conversation for voice:', e);
+        }
+      }
+
+      if (convId) formData.append('conversation_id', convId);
+
       // Send to voice endpoint
       const response = await axios.post(
         `${API_BASE_URL}/api/chat/voice`,
@@ -249,6 +396,13 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
           timeout: 30000,
         }
       );
+
+      // Capture conversation id if backend provides it
+      if (response.data?.conversation_id) {
+        setActiveConversationId(response.data.conversation_id);
+        localStorage.setItem('activeConversationId', response.data.conversation_id);
+        fetchConversations();
+      }
 
       console.log('📥 Voice response received:', response.data);
 
@@ -318,20 +472,74 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
 
   const handleClearChat = () => {
     if (window.confirm('Are you sure you want to clear chat history?')) {
-      setMessages([
-        {
-          id: generateId(),
-          type: 'bot',
-          text: 'Chat cleared! How can I help you today?',
-          timestamp: new Date(),
-        },
-      ]);
-      setSuccessMessage('Chat cleared');
+      // If user accepts, delete active conversation if set, otherwise clear local UI
+      if (activeConversationId) {
+        deleteConversation(activeConversationId);
+      } else {
+        setMessages([
+          {
+            id: generateId(),
+            type: 'bot',
+            text: 'Chat cleared! How can I help you today?',
+            timestamp: new Date(),
+          },
+        ]);
+        setSuccessMessage('Chat cleared');
+      }
     }
   };
 
   const handleResetInput = () => {
     setInputText('');
+  };
+
+  // Delete a conversation
+  const deleteConversation = async (conversationId) => {
+    if (!conversationId) return;
+    setIsLoading(true);
+    setError('');
+    try {
+      const resp = await axios.delete(`${API_BASE_URL}/api/chat/conversations/${conversationId}`);
+      if (resp.data?.status === 'success') {
+        setSuccessMessage('Conversation deleted');
+        // If we deleted the active conversation, clear UI
+        if (activeConversationId === conversationId) {
+          setActiveConversationId(null);
+          localStorage.removeItem('activeConversationId');
+          setMessages([
+            { id: generateId(), type: 'bot', text: 'Conversation cleared. Start a new chat or select another.', timestamp: new Date() }
+          ]);
+        }
+        fetchConversations();
+      } else {
+        setError('Failed to delete conversation');
+      }
+    } catch (err) {
+      console.error('❌ Error deleting conversation:', err);
+      // If server responded 405 Method Not Allowed, try POST fallback
+      if (err.response?.status === 405) {
+        try {
+          const fallback = await axios.post(`${API_BASE_URL}/api/chat/conversations/${conversationId}/delete`);
+          if (fallback.data?.status === 'success') {
+            setSuccessMessage('Conversation deleted (fallback)');
+            if (activeConversationId === conversationId) {
+              setActiveConversationId(null);
+              localStorage.removeItem('activeConversationId');
+              setMessages([
+                { id: generateId(), type: 'bot', text: 'Conversation cleared. Start a new chat or select another.', timestamp: new Date() }
+              ]);
+            }
+            fetchConversations();
+            return;
+          }
+        } catch (e) {
+          console.error('❌ Fallback delete failed:', e);
+        }
+      }
+      setError(err.response?.data?.detail || 'Failed to delete conversation');
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // ====== FETCH CHAT HISTORY ======
@@ -394,48 +602,78 @@ const HealthcareChatbot = ({ currentUser, onLogout }) => {
         </div>
       )}
 
-      {/* Messages Container */}
-      <div className="messages-container">
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`message ${msg.type === 'user' ? 'user-message' : 'bot-message'}`}
-          >
-            <div className="message-content">
-              <p>{msg.text}</p>
-              {msg.isVoice && (
-                <span className="badge badge-voice">🎤 Voice Input</span>
-              )}
-              {msg.inputType === 'voice' && msg.type === 'bot' && (
-                <button
-                  className="speak-btn"
-                  onClick={() => speakResponse(msg.text)}
-                  disabled={isSpeaking}
-                  title="Read message aloud"
-                >
-                  <FiVolume2 /> {isSpeaking ? 'Speaking...' : 'Speak'}
-                </button>
-              )}
+      <div className="chat-grid">
+        {/* Sidebar - Conversations */}
+        <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
+          <div className="sidebar-header">
+            <h3>Chats</h3>
+            <div className="sidebar-actions">
+              <button className="btn new-chat" onClick={startNewConversation}>New Chat</button>
+              <button className="btn toggle-sidebar" onClick={() => setSidebarOpen(!sidebarOpen)}>{sidebarOpen ? '◀' : '▶'}</button>
             </div>
-            <span className="message-time">
-              {msg.timestamp.toLocaleTimeString([], {
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
-            </span>
           </div>
-        ))}
-        {isLoading && (
-          <div className="message bot-message">
-            <div className="typing-indicator">
-              <span></span><span></span><span></span>
+
+          <div className="conversations-list">
+            {conversationsLoading && <div className="conv-loading">Loading...</div>}
+            {(!conversationsLoading && conversations.length === 0) && (
+              <div className="empty-convos">No conversations yet — start a new chat</div>
+            )}
+            {conversations.map((c) => (
+              <div key={c.conversation_id} className={`conversation-item ${activeConversationId === c.conversation_id ? 'active' : ''}`} onClick={() => loadConversation(c.conversation_id)}>
+                <div className="conv-title">{c.first_snippet || c.last_snippet || 'New Conversation'}</div>
+                <div className="conv-sub">{c.last_snippet ? `Latest: ${c.last_snippet}` : ''}</div>
+                <div className="conv-meta">{new Date(c.last_timestamp || c.first_timestamp).toLocaleString()} · {c.count} msgs</div>
+                <div className="conv-actions">
+                  <button className="btn small" onClick={(e) => { e.stopPropagation(); if (window.confirm('Delete this conversation?')) deleteConversation(c.conversation_id); }}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        {/* Messages Container */}
+        <div className="messages-container">
+          {messages.map((msg) => (
+            <div
+              key={msg.id}
+              className={`message ${msg.type === 'user' ? 'user-message' : 'bot-message'}`}
+            >
+              <div className="message-content">
+                <p>{msg.text}</p>
+                {msg.isVoice && (
+                  <span className="badge badge-voice">🎤 Voice Input</span>
+                )}
+                {msg.inputType === 'voice' && msg.type === 'bot' && (
+                  <button
+                    className="speak-btn"
+                    onClick={() => speakResponse(msg.text)}
+                    disabled={isSpeaking}
+                    title="Read message aloud"
+                  >
+                    <FiVolume2 /> {isSpeaking ? 'Speaking...' : 'Speak'}
+                  </button>
+                )}
+              </div>
+              <span className="message-time">
+                {msg.timestamp.toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </span>
             </div>
-            <p style={{ marginTop: '10px', fontSize: '12px', color: '#666' }}>
-              🤖 AI Model is generating response...
-            </p>
-          </div>
-        )}
-        <div ref={messagesEndRef} />
+          ))}
+          {isLoading && (
+            <div className="message bot-message">
+              <div className="typing-indicator">
+                <span></span><span></span><span></span>
+              </div>
+              <p style={{ marginTop: '10px', fontSize: '12px', color: '#666' }}>
+                🤖 AI Model is generating response...
+              </p>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
       </div>
 
       {/* Input Area */}

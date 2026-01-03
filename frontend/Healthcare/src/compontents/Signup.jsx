@@ -37,15 +37,47 @@ const Signup = ({ onSignupSuccess, onSwitchToLogin }) => {
     }
   }, [formData.password]);
 
+  const [usernameAvailable, setUsernameAvailable] = useState(null); // null=unknown, true/false
+  const [usernameChecking, setUsernameChecking] = useState(false);
+  const usernameCheckRef = React.useRef(null);
+
   const handleChange = (e) => {
     const { name, value } = e.target;
     setFormData(prev => ({ ...prev, [name]: value }));
     if (error) setError('');
+
+    if (name === 'username') {
+      // debounce availability checks
+      setUsernameAvailable(null);
+      if (usernameCheckRef.current) clearTimeout(usernameCheckRef.current);
+      const v = value;
+      usernameCheckRef.current = setTimeout(async () => {
+        if (!v || v.length < 3) {
+          setUsernameAvailable(null);
+          setUsernameChecking(false);
+          return;
+        }
+        setUsernameChecking(true);
+        try {
+          const res = await axios.get(`${API_BASE_URL}/api/auth/exists`, { params: { username: v }, timeout: 5000 });
+          setUsernameAvailable(!res.data.exists ? true : false);
+        } catch (e) {
+          // ignore transient errors but mark unknown
+          setUsernameAvailable(null);
+        } finally {
+          setUsernameChecking(false);
+        }
+      }, 500);
+    }
   };
 
   const validateForm = () => {
     if (formData.username.length < 3) {
       setError('Username must be at least 3 characters long');
+      return false;
+    }
+    if (usernameAvailable === false) {
+      setError('Username is already taken');
       return false;
     }
     if (formData.password.length < 6) {
@@ -97,16 +129,27 @@ const Signup = ({ onSignupSuccess, onSwitchToLogin }) => {
       }
     } catch (err) {
       console.error('❌ Signup error:', err);
-      
-      if (err.response?.data?.detail) {
-        setError(err.response.data.detail);
-      } else if (err.response?.data?.message) {
-        setError(err.response.data.message);
-      } else if (err.message === 'Network Error') {
-        setError(`Network error. Is backend running on ${API_BASE_URL}?`);
-      } else {
-        setError(err.message || 'Signup failed. Please try again.');
+
+      // Normalize server error shapes
+      let detail = err.response?.data?.detail ?? err.response?.data?.message ?? null;
+
+      if (Array.isArray(detail)) {
+        // pydantic validation errors come as a list of objects
+        detail = detail.map(d => d.msg || (typeof d === 'string' ? d : JSON.stringify(d))).join('; ');
       }
+
+      if (!detail) {
+        if (err.response?.status === 400) {
+          // Generic bad request - likely validation or duplicate
+          detail = 'Invalid signup data or username already exists';
+        } else if (err.message === 'Network Error') {
+          detail = `Network error. Is backend running on ${API_BASE_URL}?`;
+        } else {
+          detail = err.message || 'Signup failed. Please try again.';
+        }
+      }
+
+      setError(detail);
     } finally {
       setIsLoading(false);
     }
@@ -164,6 +207,11 @@ const Signup = ({ onSignupSuccess, onSwitchToLogin }) => {
               minLength="3"
               required
             />
+            <div className="helper-text">
+              {usernameChecking && <small>Checking availability...</small>}
+              {!usernameChecking && usernameAvailable === false && <small style={{color: '#ef4444'}}>Username is already taken</small>}
+              {!usernameChecking && usernameAvailable === true && <small style={{color: '#10b981'}}>Username is available</small>}
+            </div>
           </div>
 
           <div className="form-group">

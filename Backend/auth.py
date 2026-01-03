@@ -1,5 +1,5 @@
 # ===================== AUTHENTICATION MODULE =====================
-# User authentication and management system
+# User authentication and management system with MongoDB
 
 import os
 import json
@@ -10,6 +10,15 @@ from typing import Optional, Dict
 from pathlib import Path
 from pydantic import BaseModel, EmailStr, Field
 from fastapi import HTTPException, status
+from pymongo.errors import DuplicateKeyError
+
+# Import MongoDB connection
+try:
+    from database import get_users_collection, get_sessions_collection
+    USE_MONGODB = True
+except ImportError:
+    USE_MONGODB = False
+    print("⚠️ MongoDB not available, using JSON file storage")
 
 # ===================== CONFIGURATION =====================
 USERS_DB_FILE = os.path.join(os.path.dirname(__file__), "users.json")
@@ -47,41 +56,119 @@ class AuthResponse(BaseModel):
 # ===================== DATABASE MANAGEMENT =====================
 
 class Database:
-    """Simple JSON-based database for users and sessions"""
+    """Dual storage: MongoDB (primary) with JSON file fallback"""
     
     @staticmethod
     def load_users() -> Dict:
-        """Load users from JSON file"""
+        """Load users from MongoDB (DB-only). Raises if DB unavailable."""
+        if USE_MONGODB:
+            try:
+                users_collection = get_users_collection()
+                users_list = list(users_collection.find({}))
+                # Convert MongoDB documents to dict with user_id as key
+                return {user['user_id']: user for user in users_list}
+            except Exception as e:
+                # Fail fast - do not fall back to JSON when DB is intended to be the source of truth
+                raise RuntimeError(f"🛑 MongoDB error loading users: {e}")
+        
+        # If MongoDB not used, fall back to JSON
         if not os.path.exists(USERS_DB_FILE):
             return {}
         try:
             with open(USERS_DB_FILE, 'r') as f:
                 return json.load(f)
-        except:
-            return {}
+        except Exception as e:
+            raise RuntimeError(f"Error loading users JSON: {e}")
     
     @staticmethod
     def save_users(users: Dict):
-        """Save users to JSON file"""
-        with open(USERS_DB_FILE, 'w') as f:
-            json.dump(users, f, indent=2)
+        """Save users to MongoDB (and only JSON if MongoDB is not enabled)"""
+        if USE_MONGODB:
+            try:
+                users_collection = get_users_collection()
+                for user_id, user_data in users.items():
+                    users_collection.update_one(
+                        {'user_id': user_id},
+                        {'$set': user_data},
+                        upsert=True
+                    )
+                return
+            except Exception as e:
+                # Fail fast - do not silently write to JSON
+                raise RuntimeError(f"🛑 MongoDB error saving users: {e}")
+        
+        # If MongoDB not used, persist to JSON
+        try:
+            with open(USERS_DB_FILE, 'w') as f:
+                json.dump(users, f, indent=2)
+        except Exception as e:
+            raise RuntimeError(f"Error saving users JSON: {e}")
     
     @staticmethod
     def load_sessions() -> Dict:
-        """Load sessions from JSON file"""
+        """Load sessions from MongoDB (DB-only). Raises if DB unavailable."""
+        if USE_MONGODB:
+            try:
+                sessions_collection = get_sessions_collection()
+                sessions_list = list(sessions_collection.find({}))
+                # Convert MongoDB documents to dict with token as key
+                return {session['token']: session for session in sessions_list}
+            except Exception as e:
+                raise RuntimeError(f"🛑 MongoDB error loading sessions: {e}")
+        
+        # Fallback to JSON
         if not os.path.exists(SESSIONS_DB_FILE):
             return {}
         try:
             with open(SESSIONS_DB_FILE, 'r') as f:
                 return json.load(f)
-        except:
-            return {}
+        except Exception as e:
+            raise RuntimeError(f"Error loading sessions JSON: {e}")
     
     @staticmethod
     def save_sessions(sessions: Dict):
-        """Save sessions to JSON file"""
-        with open(SESSIONS_DB_FILE, 'w') as f:
-            json.dump(sessions, f, indent=2)
+        """Save sessions to MongoDB (and only JSON if MongoDB is not enabled)"""
+        if USE_MONGODB:
+            try:
+                sessions_collection = get_sessions_collection()
+                for token, session_data in sessions.items():
+                    session_data['token'] = token  # Ensure token is in the document
+                    sessions_collection.update_one(
+                        {'token': token},
+                        {'$set': session_data},
+                        upsert=True
+                    )
+                return
+            except Exception as e:
+                raise RuntimeError(f"🛑 MongoDB error saving sessions: {e}")
+
+        # If MongoDB not used, persist to JSON
+        try:
+            with open(SESSIONS_DB_FILE, 'w') as f:
+                json.dump(sessions, f, indent=2)
+        except Exception as e:
+            raise RuntimeError(f"Error saving sessions JSON: {e}")
+    
+    @staticmethod
+    def delete_session(token: str):
+        """Delete a session from MongoDB (DB-only)"""
+        if USE_MONGODB:
+            try:
+                sessions_collection = get_sessions_collection()
+                sessions_collection.delete_one({'token': token})
+                return
+            except Exception as e:
+                raise RuntimeError(f"🛑 MongoDB error deleting session: {e}")
+
+        # If MongoDB not used, delete from JSON
+        sessions = Database.load_sessions()
+        if token in sessions:
+            del sessions[token]
+            try:
+                with open(SESSIONS_DB_FILE, 'w') as f:
+                    json.dump(sessions, f, indent=2)
+            except Exception as e:
+                raise RuntimeError(f"Error saving sessions JSON: {e}")
 
 # ===================== AUTHENTICATION MANAGER =====================
 
@@ -228,9 +315,6 @@ class AuthManager:
     @staticmethod
     def logout(token: str):
         """Logout user by removing session"""
-        sessions = Database.load_sessions()
-        if token in sessions:
-            del sessions[token]
-            Database.save_sessions(sessions)
+        Database.delete_session(token)
 
 auth_manager = AuthManager()

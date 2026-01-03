@@ -28,7 +28,7 @@ import uuid
 from fastapi import Form, Depends, Header, status
 from pydub import AudioSegment
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from functools import wraps
 import numpy as np
@@ -77,6 +77,7 @@ class TextInput(BaseModel):
     """Request model for text input"""
     text: str = Field(..., min_length=1, max_length=1000)
     user_id: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 class VoiceResponse(BaseModel):
     """Response model for voice/text input"""
@@ -87,6 +88,7 @@ class VoiceResponse(BaseModel):
     confidence: float = 0.95
     timestamp: Optional[str] = None
     processing_time: Optional[float] = None
+    conversation_id: Optional[str] = None
 
 class ErrorResponse(BaseModel):
     """Error response model"""
@@ -373,45 +375,67 @@ statistics = Statistics()
 # ===================== 12. CHAT LOGGER =====================
 
 class ChatLogger:
-    """Log all conversations"""
-    
-    def __init__(self, log_file: str = "chat_logs.json"):
-        self.log_file = log_file
-        self.logs = []
-        self.load_logs()
-    
-    def load_logs(self):
-        """Load existing logs"""
-        if os.path.exists(self.log_file):
-            try:
-                with open(self.log_file, 'r') as f:
-                    self.logs = json.load(f)
-                logger.info(f"📖 Loaded {len(self.logs)} chat logs")
-            except Exception as e:
-                logger.error(f"Error loading logs: {e}")
-                self.logs = []
-    
-    def save_logs(self):
-        """Save logs to file"""
+    """Chat logger that stores conversation history in MongoDB (DB-only). Uses lazy initialization so startup can connect to DB during on_startup."""
+    def __init__(self):
+        self.chat_logs = None
+
+    def _ensure_connected(self):
         try:
-            with open(self.log_file, 'w') as f:
-                json.dump(self.logs, f, indent=2)
+            from database import get_chat_logs_collection, mongodb, init_mongodb
+            if not mongodb.is_connected:
+                # attempt to initialize connection (useful during startup)
+                init_mongodb()
+            if not mongodb.is_connected:
+                raise RuntimeError("MongoDB is not connected. Chat history requires MongoDB.")
+            if self.chat_logs is None:
+                self.chat_logs = get_chat_logs_collection()
+                logger.info("✅ ChatLogger connected to MongoDB")
         except Exception as e:
-            logger.error(f"Error saving logs: {e}")
-    
-    def add_log(self, user_input: str, bot_response: str, input_type: str = "text", user_id: Optional[str] = None, **metadata):
-        """Add conversation to log -- associates user_id when provided"""
+            logger.error(f"❌ ChatLogger failed to connect: {e}")
+            raise
+
+    def add_log(self, user_input: str, bot_response: str, input_type: str = "text", user_id: Optional[str] = None, conversation_id: Optional[str] = None, **metadata):
+        """Add conversation to MongoDB log. If no conversation_id is provided, generate one and return it."""
         if user_id:
             metadata['user_id'] = user_id
+        # Use provided conversation_id or generate a new one
+        conv_id = conversation_id or metadata.get('conversation_id') or str(uuid.uuid4())
+        metadata['conversation_id'] = conv_id
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "user_input": user_input,
             "bot_response": bot_response,
             "input_type": input_type,
+            "user_id": user_id,
+            "conversation_id": conv_id,
             "metadata": metadata
         }
-        self.logs.append(log_entry)
-        self.save_logs()
+        try:
+            self._ensure_connected()
+            result = self.chat_logs.insert_one(log_entry)
+            logger.debug(f"💾 Chat log saved to MongoDB: {result.inserted_id} (conv={conv_id})")
+            return conv_id
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error saving chat log to MongoDB: {e}")
+            raise HTTPException(status_code=500, detail="Failed to save chat log")
+
+    def get_user_history(self, user_id: str, limit: int = 50) -> List[Dict]:
+        """Get chat history for a specific user from MongoDB"""
+        try:
+            self._ensure_connected()
+            cursor = self.chat_logs.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
+            history = list(cursor)
+            for item in history:
+                if '_id' in item:
+                    item['_id'] = str(item['_id'])
+            return history
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error getting user history from MongoDB: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch chat history")
 
 chat_logger = ChatLogger()
 
@@ -420,6 +444,8 @@ chat_logger = ChatLogger()
 class SignupRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
+    email: Optional[str] = None
+    full_name: Optional[str] = None
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -428,6 +454,7 @@ class LoginRequest(BaseModel):
 class UserInfo(BaseModel):
     id: str
     username: str
+    email: Optional[str] = None
 
 class AuthResponse(BaseModel):
     status: str
@@ -435,92 +462,188 @@ class AuthResponse(BaseModel):
     user: Optional[UserInfo] = None
     message: Optional[str] = None
 
-class UsersManager:
-    """Simple file-backed user manager with token sessions"""
-    def __init__(self, users_file: str = "users.json"):
-        self.users_file = users_file
-        self.users: Dict[str, dict] = {}
-        self.tokens: Dict[str, str] = {}  # token -> user_id
-        self.load_users()
+class MongoDBUsersManager:
+    """MongoDB-backed user manager (DB-only) with lazy connection"""
+    def __init__(self):
+        # Lazy initialization - collections set on first use
+        self.users_collection = None
+        self.sessions_collection = None
 
-    def load_users(self):
-        if os.path.exists(self.users_file):
-            try:
-                with open(self.users_file, 'r') as f:
-                    data = json.load(f)
-                    self.users = {u['id']: u for u in data.get('users', [])}
-                    self.tokens = data.get('tokens', {})
-            except Exception as e:
-                logger.error(f"Error loading users file: {e}")
-                self.users = {}
-                self.tokens = {}
-
-    def save_users(self):
+    def _ensure_connected(self):
         try:
-            data = {
-                'users': list(self.users.values()),
-                'tokens': self.tokens
-            }
-            with open(self.users_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            from database import get_users_collection, get_sessions_collection, mongodb, init_mongodb
+            if not mongodb.is_connected:
+                # try to initialize connection (startup might not have finished yet)
+                init_mongodb()
+            if not mongodb.is_connected:
+                raise RuntimeError("MongoDB is not connected. This backend requires MongoDB for user storage.")
+            if self.users_collection is None or self.sessions_collection is None:
+                self.users_collection = get_users_collection()
+                self.sessions_collection = get_sessions_collection()
+                logger.info("✅ UsersManager connected to MongoDB")
         except Exception as e:
-            logger.error(f"Error saving users file: {e}")
+            logger.error(f"❌ UsersManager failed to connect: {e}")
+            raise
 
     def _hash_password(self, password: str, salt: str) -> str:
         hashed = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
         return hashed.hex()
 
-    def create_user(self, username: str, password: str) -> dict:
-        # Ensure username unique
-        for u in self.users.values():
-            if u['username'].lower() == username.lower():
-                raise ValueError('Username already exists')
+    def _hash_password(self, password: str, salt: str) -> str:
+        hashed = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
+        return hashed.hex()
 
-        user_id = str(uuid.uuid4())
-        salt = secrets.token_hex(16)
-        password_hash = self._hash_password(password, salt)
-        user = {
-            'id': user_id,
-            'username': username,
-            'password_hash': password_hash,
-            'salt': salt,
-            'created_at': datetime.now().isoformat()
-        }
-        self.users[user_id] = user
-        self.save_users()
-        logger.info(f"✅ Created user: {username} ({user_id})")
-        return user
+    def create_user(self, username: str, password: str, email: Optional[str] = None, full_name: Optional[str] = None) -> dict:
+        """Create new user in MongoDB (DB-only). Ensures `id` field and avoids inserting null email."""
+        try:
+            self._ensure_connected()
+            # Check if username or email already exists (case-insensitive)
+            if self.users_collection.find_one({'username': {'$regex': f'^{username}$', '$options': 'i'}}):
+                raise ValueError('Username already exists')
+            if email and self.users_collection.find_one({'email': {'$regex': f'^{email}$', '$options': 'i'}}):
+                raise ValueError('Email already exists')
+
+            user_id = str(uuid.uuid4())
+            salt = secrets.token_hex(16)
+            password_hash = self._hash_password(password, salt)
+
+            # Build user document - omit `email` entirely if not provided to avoid unique-null conflicts
+            user = {
+                'user_id': user_id,
+                'id': user_id,
+                'username': username,
+                'full_name': full_name,
+                'password_hash': password_hash,
+                'salt': salt,
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat()
+            }
+            if email:
+                user['email'] = email
+
+            # Insert with DuplicateKeyError handling for safety
+            try:
+                from pymongo.errors import DuplicateKeyError
+                self.users_collection.insert_one(user)
+            except DuplicateKeyError as dk:
+                msg = str(dk).lower()
+                # If the duplicate key references email, it's often due to a non-partial unique index
+                # on the `email` field that treats missing emails as duplicates. Attempt an automatic
+                # repair (recreate partial/sparse index) and retry once before giving up.
+                if 'email' in msg:
+                    try:
+                        from database import init_mongodb
+                        logger.warning("⚠️ DuplicateKeyError on email detected. Attempting to repair email index and retry insert...")
+                        # Re-initialize MongoDB indexes (this will drop and recreate email index if needed)
+                        init_mongodb()
+                        # Refresh collection handle in case indexes/connection changed
+                        self.users_collection = get_users_collection()
+                        # Retry insert once
+                        try:
+                            self.users_collection.insert_one(user)
+                            logger.info("✅ Insert succeeded after index repair")
+                        except DuplicateKeyError:
+                            # Still failing: surface a friendly error
+                            raise ValueError('Email already exists')
+                        return user
+                    except Exception as e:
+                        logger.error(f"❌ Failed to auto-repair email index: {e}")
+                        raise ValueError('Email already exists')
+                if 'username' in msg:
+                    raise ValueError('Username already exists')
+                raise
+
+            logger.info(f"✅ Created user in MongoDB: {username} ({user_id})")
+            logger.info(f"Returning user from create_user: {user}")
+            return user
+
+        except ValueError:
+            # propagate validation errors
+            raise
+        except Exception as e:
+            logger.error(f"❌ MongoDB error creating user: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create user")
 
     def verify_user(self, username: str, password: str) -> Optional[dict]:
-        for u in self.users.values():
-            if u['username'].lower() == username.lower():
-                expected = u['password_hash']
-                derived = self._hash_password(password, u['salt'])
-                if secrets.compare_digest(derived, expected):
-                    return u
-        return None
+        """Verify user credentials from MongoDB (DB-only)"""
+        try:
+            self._ensure_connected()
+            user = self.users_collection.find_one({'username': {'$regex': f'^{username}$', '$options': 'i'}})
+            if not user:
+                return None
+            expected = user['password_hash']
+            derived = self._hash_password(password, user['salt'])
+            if secrets.compare_digest(derived, expected):
+                # Ensure 'id' field exists for compatibility with existing code
+                if 'id' not in user:
+                    user['id'] = user.get('user_id', str(user.get('_id', '')))
+                return user
+            return None
+        except Exception as e:
+            logger.error(f"❌ MongoDB error verifying user: {e}")
+            raise HTTPException(status_code=500, detail="Failed to verify user")
 
     def create_token(self, user_id: str) -> str:
+        """Create authentication token in MongoDB (DB-only)"""
         token = secrets.token_urlsafe(32)
-        self.tokens[token] = user_id
-        self.save_users()
-        return token
+        try:
+            self._ensure_connected()
+            session = {
+                'token': token,
+                'user_id': user_id,
+                'created_at': datetime.now().isoformat(),
+                'expires_at': (datetime.now() + timedelta(days=30)).isoformat()
+            }
+            self.sessions_collection.insert_one(session)
+            logger.info(f"✅ Created token in MongoDB for user: {user_id}")
+            return token
+        except Exception as e:
+            logger.error(f"❌ MongoDB error creating token: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create session token")
 
     def revoke_token(self, token: str):
-        if token in self.tokens:
-            del self.tokens[token]
-            self.save_users()
+        """Revoke authentication token from MongoDB (DB-only)"""
+        try:
+            self._ensure_connected()
+            self.sessions_collection.delete_one({'token': token})
+            logger.info(f"✅ Revoked token in MongoDB")
+        except Exception as e:
+            logger.error(f"❌ MongoDB error revoking token: {e}")
+            raise HTTPException(status_code=500, detail="Failed to revoke token")
 
     def get_user_by_token(self, token: str) -> Optional[dict]:
-        user_id = self.tokens.get(token)
-        if not user_id:
-            return None
-        return self.users.get(user_id)
+        """Get user by authentication token from MongoDB (DB-only)"""
+        try:
+            self._ensure_connected()
+            session = self.sessions_collection.find_one({'token': token})
+            if not session:
+                return None
+            # Check expiry
+            expires_at = datetime.fromisoformat(session['expires_at'])
+            if datetime.now() > expires_at:
+                self.sessions_collection.delete_one({'token': token})
+                return None
+            user = self.users_collection.find_one({'user_id': session['user_id']})
+            if user and 'id' not in user:
+                user['id'] = user.get('user_id', str(user.get('_id', '')))
+            return user
+        except Exception as e:
+            logger.error(f"❌ MongoDB error getting user by token: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve user by token")
 
     def get_user_by_id(self, user_id: str) -> Optional[dict]:
-        return self.users.get(user_id)
+        """Get user by ID from MongoDB (DB-only)"""
+        try:
+            self._ensure_connected()
+            user = self.users_collection.find_one({'user_id': user_id})
+            if user and 'id' not in user:
+                user['id'] = user.get('user_id', str(user.get('_id', '')))
+            return user
+        except Exception as e:
+            logger.error(f"❌ MongoDB error getting user by ID: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve user by id")
 
-users_manager = UsersManager()
+users_manager = MongoDBUsersManager()
 
 # Dependency to get current user from Authorization header (Bearer <token>)
 async def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
@@ -560,11 +683,20 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint with detailed status"""
+    """Health check endpoint with detailed status including MongoDB connection"""
+    mongodb_status = {"connected": False, "message": "Not configured"}
+    
+    try:
+        from database import mongodb
+        mongodb_status = mongodb.check_connection()
+    except Exception as e:
+        mongodb_status = {"connected": False, "message": f"Error: {str(e)}"}
+    
     return {
         "status": "healthy" if model_manager.is_loaded else "degraded",
         "device": DEVICE,
         "model_loaded": model_manager.is_loaded if model_manager else False,
+        "mongodb": mongodb_status,
         "timestamp": datetime.now().isoformat(),
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available()
@@ -586,12 +718,21 @@ async def get_stats():
 async def signup(payload: SignupRequest):
     """Create a new user account"""
     try:
-        user = users_manager.create_user(payload.username, payload.password)
+        user = users_manager.create_user(
+            payload.username, 
+            payload.password,
+            email=payload.email,
+            full_name=payload.full_name
+        )
+        logger.debug(f"Created user object: {user}")
+        if 'id' not in user:
+            logger.error(f"Signup returned user without 'id': {user}")
+            raise HTTPException(status_code=500, detail="Internal error: created user missing id")
         token = users_manager.create_token(user['id'])
         return AuthResponse(
             status='success', 
             token=token,
-            user=UserInfo(id=user['id'], username=user['username']),
+            user=UserInfo(id=user['id'], username=user['username'], email=user.get('email')),
             message='Account created successfully'
         )
     except ValueError as ve:
@@ -619,6 +760,27 @@ async def login(payload: LoginRequest):
     except Exception as e:
         logger.error(f"Login error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/api/auth/exists')
+async def username_exists(username: Optional[str] = None):
+    """Check if a username exists (case-insensitive). Returns {"exists": bool}."""
+    if not username or not username.strip():
+        raise HTTPException(status_code=400, detail='`username` query parameter is required')
+    try:
+        # Use users_manager to fetch by username
+        # users_manager.verify_user expects a password; so query DB directly using users_manager helper
+        user = users_manager.get_user_by_id(username) if False else None  # placeholder to satisfy linters
+        # Query MongoDB directly for availability
+        users_manager._ensure_connected()
+        doc = users_manager.users_collection.find_one({'username': {'$regex': f'^{username}$', '$options': 'i'}})
+        exists = doc is not None
+        return {"exists": exists}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking username existence: {e}")
+        raise HTTPException(status_code=500, detail='Failed to check username')
 
 @app.post('/api/auth/logout')
 async def logout(authorization: Optional[str] = Header(None)):
@@ -659,11 +821,13 @@ async def text_chat(request: TextInput, background_tasks: BackgroundTasks, curre
             logger.info("⚡ Cache hit!")
             response_time = time.time() - start_time
             statistics.record_request("text", response_time)
+            # Determine conversation id (generate if not provided)
+            conv_id = request.conversation_id if getattr(request, 'conversation_id', None) else str(uuid.uuid4())
             # Attach user_id if authenticated
             if current_user:
-                background_tasks.add_task(chat_logger.add_log, input_text, cached_response, "text", user_id=current_user['id'], cached=True)
+                background_tasks.add_task(chat_logger.add_log, input_text, cached_response, "text", user_id=current_user['id'], conversation_id=conv_id, cached=True)
             else:
-                background_tasks.add_task(chat_logger.add_log, input_text, cached_response, "text", cached=True)
+                background_tasks.add_task(chat_logger.add_log, input_text, cached_response, "text", conversation_id=conv_id, cached=True)
             
             return VoiceResponse(
                 status="success",
@@ -672,7 +836,8 @@ async def text_chat(request: TextInput, background_tasks: BackgroundTasks, curre
                 response=cached_response,
                 confidence=0.95,
                 timestamp=datetime.now().isoformat(),
-                processing_time=response_time
+                processing_time=response_time,
+                conversation_id=conv_id
             )
         
         # Generate response
@@ -686,11 +851,12 @@ async def text_chat(request: TextInput, background_tasks: BackgroundTasks, curre
         
         response_time = time.time() - start_time
         statistics.record_request("text", response_time)
-        # Attach user metadata when available
+        # Determine conversation id: prefer client-provided, else generate one now so we can return it to the client
+        conv_id = request.conversation_id if getattr(request, 'conversation_id', None) else str(uuid.uuid4())
         if current_user:
-            background_tasks.add_task(chat_logger.add_log, input_text, response, "text", user_id=current_user['id'])
+            background_tasks.add_task(chat_logger.add_log, input_text, response, "text", user_id=current_user['id'], conversation_id=conv_id)
         else:
-            background_tasks.add_task(chat_logger.add_log, input_text, response, "text")
+            background_tasks.add_task(chat_logger.add_log, input_text, response, "text", conversation_id=conv_id)
         
         logger.info(f"✅ Text response: {input_text[:50]}... → {response[:50]}...")
         
@@ -701,7 +867,8 @@ async def text_chat(request: TextInput, background_tasks: BackgroundTasks, curre
             response=response,
             confidence=0.95,
             timestamp=datetime.now().isoformat(),
-            processing_time=response_time
+            processing_time=response_time,
+            conversation_id=conv_id
         )
     
     except HTTPException:
@@ -712,12 +879,152 @@ async def text_chat(request: TextInput, background_tasks: BackgroundTasks, curre
         statistics.record_request("text", time.time() - start_time, error=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/chat/history")
+async def chat_history(limit: int = 50, current_user: dict = Depends(get_current_user)):
+    """Get authenticated user's chat history (latest first)"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        history = chat_logger.get_user_history(current_user['id'], limit=limit)
+        return {"status": "success", "data": history}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error fetching chat history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/api/chat/conversations')
+async def list_conversations(limit: int = 50, current_user: dict = Depends(get_current_user)):
+    """List conversation threads for authenticated user, ordered newest first"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        chat_logger._ensure_connected()
+        # Get both first and last messages per conversation (first = earliest, last = latest)
+        pipeline = [
+            {"$match": {"user_id": current_user['id']}},
+            {"$sort": {"timestamp": 1}},  # ascending so $first is the earliest
+            {"$group": {
+                "_id": "$conversation_id",
+                "first_timestamp": {"$first": "$timestamp"},
+                "first_user_input": {"$first": "$user_input"},
+                "first_bot_response": {"$first": "$bot_response"},
+                "last_timestamp": {"$last": "$timestamp"},
+                "last_user_input": {"$last": "$user_input"},
+                "last_bot_response": {"$last": "$bot_response"},
+                "count": {"$sum": 1}
+            }},
+            {"$sort": {"last_timestamp": -1}},
+            {"$limit": limit}
+        ]
+        results = list(chat_logger.chat_logs.aggregate(pipeline))
+        conversations = []
+        for r in results:
+            first_snip = (r.get('first_user_input') or r.get('first_bot_response')) or ''
+            last_snip = (r.get('last_user_input') or r.get('last_bot_response')) or ''
+            conversations.append({
+                "conversation_id": r.get('_id'),
+                "first_timestamp": r.get('first_timestamp'),
+                "first_snippet": first_snip[:200] if first_snip else '',
+                "last_timestamp": r.get('last_timestamp'),
+                "last_snippet": last_snip[:200] if last_snip else '',
+                "count": r.get('count', 0)
+            })
+        return {"status": "success", "data": conversations}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error listing conversations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list conversations")
+
+
+@app.get('/api/chat/conversations/{conversation_id}')
+async def get_conversation(conversation_id: str, limit: int = 100, current_user: dict = Depends(get_current_user)):
+    """Get messages for a conversation thread"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        chat_logger._ensure_connected()
+        cursor = chat_logger.chat_logs.find({"user_id": current_user['id'], "conversation_id": conversation_id}).sort("timestamp", 1).limit(limit)
+        messages = list(cursor)
+        for m in messages:
+            if '_id' in m:
+                m['_id'] = str(m['_id'])
+        return {"status": "success", "data": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error fetching conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch conversation")
+
+
+@app.post('/api/chat/conversations')
+async def create_conversation(payload: Dict = None, current_user: dict = Depends(get_current_user)):
+    """Create a new conversation for the authenticated user. Optional JSON body: { "initial_message": "..." }"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        body = payload or {}
+        initial = body.get('initial_message') if isinstance(body, dict) else None
+        # Generate conversation id
+        conv_id = str(uuid.uuid4())
+        chat_logger._ensure_connected()
+        # Create an initial system/bot message so the conversation shows a first message
+        if initial:
+            # log initial user message; bot_response may be empty until model replies
+            chat_logger.add_log(initial, "", "text", user_id=current_user['id'], conversation_id=conv_id)
+        else:
+            # create a starter bot message
+            chat_logger.add_log("", "Conversation started", "system", user_id=current_user['id'], conversation_id=conv_id)
+        return {"status": "success", "conversation_id": conv_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
+
+
+@app.delete('/api/chat/conversations/{conversation_id}')
+async def delete_conversation(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete all messages for a conversation (owned by the authenticated user)"""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        chat_logger._ensure_connected()
+        result = chat_logger.chat_logs.delete_many({"user_id": current_user['id'], "conversation_id": conversation_id})
+        logger.info(f"🗑️ Deleted {result.deleted_count} messages for conversation {conversation_id}")
+        return {"status": "success", "deleted": int(result.deleted_count)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error deleting conversation {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete conversation")
+
+
+@app.post('/api/chat/conversations/{conversation_id}/delete')
+async def delete_conversation_post(conversation_id: str, current_user: dict = Depends(get_current_user)):
+    """Fallback delete endpoint using POST for clients that cannot send DELETE. Calls same delete logic."""
+    return await delete_conversation(conversation_id, current_user=current_user)
+
+
+@app.options('/api/chat/conversations/{conversation_id}')
+async def options_conversation(conversation_id: str):
+    """Answer preflight OPTIONS for conversation routes."""
+    from fastapi.responses import Response
+    headers = {
+        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    }
+    return Response(status_code=200, headers=headers)
+
 @app.post("/api/chat/voice", response_model=VoiceResponse)
-async def voice_chat(file: UploadFile = File(...), background_tasks: BackgroundTasks = None, current_user: Optional[dict] = Depends(get_current_user)):
+async def voice_chat(file: UploadFile = File(...), conversation_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None, current_user: Optional[dict] = Depends(get_current_user)):
     """
     Process voice input, transcribe, and return AI response
     
     Accepts: WAV, MP3, FLAC, OGG, WebM audio files
+    Optional: conversation_id (form field) to attach message to a conversation
     """
     start_time = time.time()
     
@@ -757,7 +1064,8 @@ async def voice_chat(file: UploadFile = File(...), background_tasks: BackgroundT
         
         response_time = time.time() - start_time
         statistics.record_request("voice", response_time)
-        
+        # Ensure conversation id exists (client may provide or we generate one)
+        conv_id = conversation_id or str(uuid.uuid4())
         if background_tasks:
             if current_user:
                 background_tasks.add_task(
@@ -766,6 +1074,7 @@ async def voice_chat(file: UploadFile = File(...), background_tasks: BackgroundT
                     response,
                     "voice",
                     user_id=current_user['id'],
+                    conversation_id=conv_id,
                     audio_file=file.filename
                 )
             else:
@@ -774,10 +1083,22 @@ async def voice_chat(file: UploadFile = File(...), background_tasks: BackgroundT
                     transcribed_text,
                     response,
                     "voice",
+                    conversation_id=conv_id,
                     audio_file=file.filename
                 )
         
-        logger.info(f"✅ Voice response: {transcribed_text[:50]}... → {response[:50]}...")
+        logger.info(f"✅ Voice response: {transcribed_text[:50]}... → {response[:50]}... (conv={conv_id})")
+
+        return VoiceResponse(
+            status="success",
+            input_type="voice",
+            input_text=transcribed_text,
+            response=response,
+            confidence=float(confidence),
+            timestamp=datetime.now().isoformat(),
+            processing_time=response_time,
+            conversation_id=conv_id
+        )
         
         return VoiceResponse(
             status="success",
@@ -847,19 +1168,27 @@ async def batch_chat(request: BatchRequest, background_tasks: BackgroundTasks):
 
 @app.get("/api/logs")
 async def get_logs(limit: int = 50, user_id: Optional[str] = None, current_user: Optional[dict] = Depends(get_current_user)):
-    """Get recent chat logs. If authenticated, returns only the logs for the current user (unless user_id param equals the current user id)."""
+    """Get recent chat logs from MongoDB. If authenticated, returns only the logs for the current user (unless user_id param equals the current user id)."""
     try:
-        # If requester is authenticated, return only that user's logs (or allow same-id filter)
+        # Ensure ChatLogger is connected to DB
+        try:
+            chat_logger._ensure_connected()
+        except Exception as e:
+            logger.error(f"Error ensuring chat logger DB connection: {e}")
+            raise HTTPException(status_code=503, detail="Chat logs database not available")
+
         if current_user:
             if user_id and user_id != current_user['id']:
                 raise HTTPException(status_code=403, detail="Forbidden: cannot access other user's logs")
-            # Filter logs for user
-            filtered = [l for l in chat_logger.logs if l.get('metadata', {}).get('user_id') == current_user['id']]
-            recent_logs = filtered[-limit:]
+
+            # Fetch user's logs from DB
+            history = chat_logger.get_user_history(current_user['id'], limit=limit)
+            total = chat_logger.chat_logs.count_documents({"user_id": current_user['id']})
+
             return {
                 "status": "success",
-                "total_logs": len(filtered),
-                "recent_logs": recent_logs,
+                "total_logs": total,
+                "recent_logs": history,
                 "user_id": current_user['id'],
                 "timestamp": datetime.now().isoformat()
             }
@@ -867,19 +1196,23 @@ async def get_logs(limit: int = 50, user_id: Optional[str] = None, current_user:
             # Unauthenticated - disallow user-specific queries
             if user_id:
                 raise HTTPException(status_code=401, detail="Authentication required to view user-specific logs")
-            recent_logs = chat_logger.logs[-limit:]
-            # Return logs without revealing metadata user_ids in unauthenticated mode
-            sanitized = []
-            for l in recent_logs:
-                copy = dict(l)
-                # remove user id if present
-                if 'metadata' in copy and 'user_id' in copy['metadata']:
-                    copy['metadata'] = {k: v for k, v in copy['metadata'].items() if k != 'user_id'}
-                sanitized.append(copy)
+
+            # Fetch recent global logs
+            cursor = chat_logger.chat_logs.find({}).sort("timestamp", -1).limit(limit)
+            recent_logs = []
+            for item in cursor:
+                if '_id' in item:
+                    item['_id'] = str(item['_id'])
+                # sanitize metadata
+                if 'metadata' in item and 'user_id' in item['metadata']:
+                    item['metadata'] = {k: v for k, v in item['metadata'].items() if k != 'user_id'}
+                recent_logs.append(item)
+
+            total = chat_logger.chat_logs.count_documents({})
             return {
                 "status": "success",
-                "total_logs": len(chat_logger.logs),
-                "recent_logs": sanitized,
+                "total_logs": total,
+                "recent_logs": recent_logs,
                 "timestamp": datetime.now().isoformat()
             }
     except HTTPException:
@@ -986,12 +1319,33 @@ async def startup_event():
     logger.info(f"🖥️  Device: {DEVICE}")
     logger.info(f"📁 Model path: {MODEL_PATH}")
     logger.info(f"✅ Model loaded: {model_manager.is_loaded if model_manager else False}")
+    
+    # Initialize MongoDB connection
+    try:
+        from database import init_mongodb, mongodb
+        if init_mongodb():
+            logger.info("✅ MongoDB connected successfully!")
+            status = mongodb.check_connection()
+            logger.info(f"📊 Database: {status['database']}")
+            logger.info(f"📦 Collections: {status.get('collections', [])}")
+            logger.info(f"📈 Document counts: {status.get('document_counts', {})}")
+        else:
+            logger.warning("⚠️ MongoDB connection failed - using JSON file storage as fallback")
+    except Exception as e:
+        logger.warning(f"⚠️ MongoDB initialization error: {e} - using JSON file storage as fallback")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("👋 Healthcare Chatbot API shutting down...")
     logger.info(f"📊 Final stats: {statistics.get_stats()}")
+    
+    # Close MongoDB connection
+    try:
+        from database import mongodb
+        mongodb.disconnect()
+    except:
+        pass
 
 # ===================== 15. MAIN EXECUTION =====================
 
